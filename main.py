@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime
 
-TOKEN = '7581216232:AAHq0Wolnv1rmwdKL9GpzZP8bP1HweKBTps'
+TOKEN = 'ttt'
 bot = telebot.TeleBot(TOKEN)
 
 MAX_DBS_PER_USER = 20
