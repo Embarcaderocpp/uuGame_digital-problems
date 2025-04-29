@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime
 
-TOKEN = '5780848157:AAEr7aF0jRYIigm9PHv4T_2ojxxKSF6dxWI'
+TOKEN = '7581216232:AAHq0Wolnv1rmwdKL9GpzZP8bP1HweKBTps'
 bot = telebot.TeleBot(TOKEN)
 
 MAX_DBS_PER_USER = 20
@@ -46,12 +46,15 @@ def create_db_if_not_exists(chat_id, db_name):
             problem_id INTEGER PRIMARY KEY AUTOINCREMENT,
             problem TEXT NOT NULL,
             time_create DATETIME DEFAULT CURRENT_TIMESTAMP,
-            time_send DATETIME NOT NULL
+            time_send DATETIME NOT NULL,
+            confirmed BOOLEAN DEFAULT FALSE,
+            last_notification DATETIME  
         )"""
     )
     conn.commit()
     conn.close()
     return True
+
 
 
 def get_user_dbs(chat_id):
@@ -371,55 +374,233 @@ def handle_delete_task(call):
         bot.answer_callback_query(call.id, "❌ Ошибка при удалении!")
 
 
+@bot.message_handler(commands=['time_date'])
+def handle_time_date(message):
+    try:
+        # Получаем текущее время сервера
+        server_time = datetime.now()
+        time_str = server_time.strftime("%Y-%m-%d %H:%M:%S")
+        timezone_str = time.tzname[0]  # Получаем название часового пояса
+
+        # Дополнительная диагностика
+        timestamp = time.time()
+        localtime = time.localtime()
+        gmtime = time.gmtime()
+
+        response = (
+            f"⏰ <b>Текущее время сервера</b>:\n"
+            f"• Дата и время: <code>{time_str}</code>\n"
+            f"• Часовой пояс: <code>{timezone_str}</code>\n"
+            f"• Timestamp: <code>{timestamp}</code>\n\n"
+            f"<b>Сравнение</b>:\n"
+            f"• Локальное время: <code>{time.strftime('%Y-%m-%d %H:%M:%S', localtime)}</code>\n"
+            f"• UTC время: <code>{time.strftime('%Y-%m-%d %H:%M:%S', gmtime)}</code>\n\n"
+            f"Если время неверное, проверьте:\n"
+            f"1) Настройки часового пояса сервера\n"
+            f"2) Сервис синхронизации времени (ntpd)\n"
+            f"3) Docker-контейнер (если используется)"
+        )
+
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка при получении времени: {str(e)}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_task:"))
+def handle_confirmation(call):
+    try:
+        _, db_name, task_id = call.data.split(":")
+        chat_id = call.message.chat.id
+
+        confirm_task_in_db(chat_id, db_name, task_id)
+
+        bot.edit_message_text(
+            "✅ Задача подтверждена",
+            chat_id=chat_id,
+            message_id=call.message.message_id
+        )
+        bot.answer_callback_query(call.id, "Вы приступили к задаче!")
+
+    except Exception as e:
+        print(f"Ошибка подтверждения: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка подтверждения!")
+
+
+
+
 import threading
 import time
 from datetime import datetime
+import pytz
+
+
+def confirm_task_in_db(chat_id, db_name, task_id):
+    user_folder = create_user_folder(chat_id)
+    db_path = f"{user_folder}/{db_name}.sqlite"
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE problems SET confirmed = TRUE WHERE problem_id = ?",
+        (task_id,)
+    )
+    conn.commit()
+    conn.close()
 
 
 def check_and_notify():
+    msk_timezone = pytz.timezone('Europe/Moscow')
+
     while True:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        nearest_task = None
+        try:
+            now_msk = datetime.now(msk_timezone)
+            current_time_str = now_msk.strftime("%Y-%m-%d %H:%M:%S")
 
-        for user_folder in os.listdir("users_data"):
-            if not user_folder.isdigit():
-                continue
-
-            chat_id = int(user_folder)
-            user_dbs = get_user_dbs(chat_id)
-
-            for db_name in user_dbs:
-                problems = get_problems_from_db(chat_id, db_name.replace(".sqlite", ""))
-                if not problems:
+            for user_folder in os.listdir("users_data"):
+                if not user_folder.isdigit():
                     continue
 
-                for task in problems:
-                    _, task_text, _, time_send = task
-                    if time_send == now:
-                        bot.send_message(
-                            chat_id,
-                            f"⏰ **Напоминание**\n📌 Задача: `{task_text}`\n🕒 Время: `{time_send}`",
-                            parse_mode="Markdown"
+                chat_id = int(user_folder)
+                user_dbs = get_user_dbs(chat_id)
+
+                for db_name in user_dbs:
+                    clean_db_name = db_name.replace(".sqlite", "")
+                    db_path = f"users_data/{user_folder}/{db_name}"
+
+                    try:
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+
+                        # Проверяем и добавляем недостающие столбцы
+                        cursor.execute("PRAGMA table_info(problems)")
+                        columns = [col[1] for col in cursor.fetchall()]
+
+                        if 'confirmed' not in columns:
+                            cursor.execute("ALTER TABLE problems ADD COLUMN confirmed BOOLEAN DEFAULT FALSE")
+                        if 'last_notification' not in columns:
+                            cursor.execute("ALTER TABLE problems ADD COLUMN last_notification DATETIME")
+
+                        conn.commit()
+
+                        # Получаем неподтвержденные задачи
+                        cursor.execute(
+                            """SELECT problem_id, problem, time_send, last_notification 
+                               FROM problems 
+                               WHERE confirmed = FALSE AND time_send <= ?""",
+                            (current_time_str,)
                         )
-                        # Удаляем задачу после отправки
-                        delete_problem_from_db(chat_id, db_name.replace(".sqlite", ""), task[0])
+                        tasks = cursor.fetchall()
 
-                    # Ищем ближайшую задачу для оптимизации
-                    task_time = datetime.strptime(time_send, "%Y-%m-%d %H:%M:%S")
-                    if task_time > datetime.now():
-                        if nearest_task is None or task_time < nearest_task[0]:
-                            nearest_task = (task_time, chat_id, db_name, task_text)
+                        for task in tasks:
+                            task_id, task_text, time_send, last_notif = task
 
-        # Если есть ближайшая задача, ждём до её времени
-        if nearest_task:
-            wait_time = (nearest_task[0] - datetime.now()).total_seconds()
-            time.sleep(min(wait_time, 1))  # Ждём не более 1 секунды
-        else:
-            time.sleep(1)  # Дефолтный интервал
+                            # Преобразуем last_notif в aware datetime если оно есть
+                            if last_notif:
+                                last_notif_dt = datetime.strptime(last_notif, "%Y-%m-%d %H:%M:%S")
+                                last_notif_dt = msk_timezone.localize(last_notif_dt)
+                            else:
+                                last_notif_dt = None
+
+                            # Проверяем необходимость напоминания
+                            if last_notif_dt is None:
+                                need_reminder = True
+                            else:
+                                time_diff = (now_msk - last_notif_dt).total_seconds()
+                                need_reminder = time_diff >= 120  # 2 минуты
+
+                            if need_reminder:
+                                markup = types.InlineKeyboardMarkup()
+                                confirm_btn = types.InlineKeyboardButton(
+                                    "✅ Подтвердить выполнение",
+                                    callback_data=f"confirm_task:{clean_db_name}:{task_id}"
+                                )
+                                markup.add(confirm_btn)
+
+                                bot.send_message(
+                                    chat_id,
+                                    f"🔔 Напоминание\nЗадача: {task_text}\nВремя: {time_send}",
+                                    reply_markup=markup
+                                )
+
+                                # Обновляем время последнего уведомления
+                                cursor.execute(
+                                    "UPDATE problems SET last_notification = ? WHERE problem_id = ?",
+                                    (current_time_str, task_id)
+                                )
+                                conn.commit()
+
+                    except Exception as e:
+                        print(f"Ошибка при работе с БД {db_name}: {e}")
+                    finally:
+                        if conn:
+                            conn.close()
+
+            time.sleep(60 - datetime.now().second)
+
+        except Exception as e:
+            print(f"Ошибка в check_and_notify: {e}")
+            time.sleep(10)
+
+
+def update_existing_dbs():
+    for user_folder in os.listdir("users_data"):
+        if not user_folder.isdigit():
+            continue
+
+        for db_file in os.listdir(f"users_data/{user_folder}"):
+            if db_file.endswith(".sqlite"):
+                conn = sqlite3.connect(f"users_data/{user_folder}/{db_file}")
+                cursor = conn.cursor()
+
+                # Добавляем столбцы, если их нет
+                cursor.execute("PRAGMA table_info(problems)")
+                columns = [col[1] for col in cursor.fetchall()]
+
+                if "confirmed" not in columns:
+                    cursor.execute("ALTER TABLE problems ADD COLUMN confirmed BOOLEAN DEFAULT FALSE")
+
+                if "last_notification" not in columns:
+                    cursor.execute("ALTER TABLE problems ADD COLUMN last_notification DATETIME")
+
+                conn.commit()
+                conn.close()
 
 
 if __name__ == '__main__':
+    update_existing_dbs()  # Вызываем один раз
     reminder_thread = threading.Thread(target=check_and_notify, daemon=True)
     reminder_thread.start()
     bot.polling(none_stop=True)
 
+
+
+#def update_all_databases():
+#    for user_folder in os.listdir("users_data"):
+#        if not user_folder.isdigit():
+#            continue
+#
+#        for db_file in os.listdir(f"users_data/{user_folder}"):
+#            if db_file.endswith(".sqlite"):
+#                try:
+#                    conn = sqlite3.connect(f"users_data/{user_folder}/{db_file}")
+#                    cursor = conn.cursor()
+#
+#                    cursor.execute("PRAGMA table_info(problems)")
+#                    columns = [col[1] for col in cursor.fetchall()]
+#
+#                    if 'confirmed' not in columns:
+#                        cursor.execute("ALTER TABLE problems ADD COLUMN confirmed BOOLEAN DEFAULT FALSE")
+#                        print(f"Added 'confirmed' to {user_folder}/{db_file}")
+#
+#                    if 'last_notification' not in columns:
+#                        cursor.execute("ALTER TABLE problems ADD COLUMN last_notification DATETIME")
+#                        print(f"Added 'last_notification' to {user_folder}/{db_file}")
+#
+#                    conn.commit()
+#                except Exception as e:
+#                    print(f"Error updating {user_folder}/{db_file}: {e}")
+#                finally:
+#                    if conn:
+#                        conn.close()
+#
